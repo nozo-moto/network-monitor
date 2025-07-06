@@ -32,8 +32,40 @@ type ConnectionInfo struct {
 	Type       string
 }
 
+type NetworkFlowStats struct {
+	SourceIP      string
+	DestIP        string
+	BytesSent     uint64
+	BytesReceived uint64
+	PacketCount   uint64
+	FirstSeen     time.Time
+	LastSeen      time.Time
+}
+
+type ConnectionHistory struct {
+	LocalAddr  string
+	RemoteAddr string
+	State      string
+	StartTime  time.Time
+	EndTime    *time.Time
+	Duration   time.Duration
+	BytesSent  uint64
+	BytesRecv  uint64
+}
+
+type TrafficDataPoint struct {
+	Time      time.Time
+	BytesIn   uint64
+	BytesOut  uint64
+	Connections int
+}
+
 type Metrics struct {
-	Network *NetworkStats
-	System  *SystemStats
-	Conns   []ConnectionInfo
+	Network      *NetworkStats
+	System       *SystemStats
+	Conns        []ConnectionInfo
+	FlowStats    map[string]*NetworkFlowStats // key: src->dst
+	ConnHistory  []ConnectionHistory
+	CurrentTime  time.Time
+	TrafficHistory []TrafficDataPoint // Time series data for line graph
 }

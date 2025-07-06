@@ -17,13 +17,20 @@ type Dashboard struct {
 	networkCollector *collector.NetworkCollector
 	systemCollector  *collector.SystemCollector
 	
+	dateTimeView    *tview.TextView
 	systemInfo      *tview.TextView
 	networkInfo     *tview.TextView
 	connectionsList *tview.TextView
+	flowStatsView   *tview.TextView
+	historyView     *tview.TextView
 	
 	metrics         *types.Metrics
 	mu              sync.RWMutex
 	updateInterval  time.Duration
+	
+	// For tracking connection history
+	activeConns     map[string]time.Time
+	historyMu       sync.RWMutex
 }
 
 func NewDashboard() *Dashboard {
@@ -31,8 +38,13 @@ func NewDashboard() *Dashboard {
 		app:             tview.NewApplication(),
 		networkCollector: collector.NewNetworkCollector(),
 		systemCollector:  collector.NewSystemCollector(),
-		metrics:         &types.Metrics{},
+		metrics:         &types.Metrics{
+			FlowStats:      make(map[string]*types.NetworkFlowStats),
+			ConnHistory:    make([]types.ConnectionHistory, 0),
+			TrafficHistory: make([]types.TrafficDataPoint, 0),
+		},
 		updateInterval:  time.Second,
+		activeConns:     make(map[string]time.Time),
 	}
 }
 
@@ -45,6 +57,13 @@ func (d *Dashboard) Run() error {
 }
 
 func (d *Dashboard) setupUI() {
+	// Date/Time view at the top
+	d.dateTimeView = tview.NewTextView().
+		SetDynamicColors(true).
+		SetTextAlign(tview.AlignCenter)
+	d.dateTimeView.SetBorder(true).
+		SetTitle(" Current Date & Time ")
+	
 	d.systemInfo = tview.NewTextView().
 		SetDynamicColors(true)
 	d.systemInfo.SetBorder(true).
@@ -60,14 +79,39 @@ func (d *Dashboard) setupUI() {
 	d.connectionsList.SetBorder(true).
 		SetTitle(" Active Connections ")
 	
+	d.flowStatsView = tview.NewTextView().
+		SetDynamicColors(true)
+	d.flowStatsView.SetBorder(true).
+		SetTitle(" Network Flow Statistics ")
+	
+	d.historyView = tview.NewTextView().
+		SetDynamicColors(true)
+	d.historyView.SetBorder(true).
+		SetTitle(" Traffic Volume Graph ")
+	
+	// Left panel with system and network info
 	leftPanel := tview.NewFlex().
 		SetDirection(tview.FlexRow).
 		AddItem(d.systemInfo, 8, 1, false).
 		AddItem(d.networkInfo, 0, 1, false)
 	
+	// Right panel with connections and flow stats
+	rightPanel := tview.NewFlex().
+		SetDirection(tview.FlexRow).
+		AddItem(d.connectionsList, 0, 1, false).
+		AddItem(d.flowStatsView, 0, 1, false)
+	
+	// Top section with left and right panels
+	topSection := tview.NewFlex().
+		AddItem(leftPanel, 40, 1, false).
+		AddItem(rightPanel, 0, 1, false)
+	
+	// Main layout with date/time at top, panels in middle, history at bottom
 	mainFlex := tview.NewFlex().
-		AddItem(leftPanel, 0, 1, false).
-		AddItem(d.connectionsList, 60, 1, false)
+		SetDirection(tview.FlexRow).
+		AddItem(d.dateTimeView, 3, 1, false).
+		AddItem(topSection, 0, 1, false).
+		AddItem(d.historyView, 0, 1, false)
 	
 	d.app.SetRoot(mainFlex, true).
 		SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
@@ -92,6 +136,8 @@ func (d *Dashboard) updateLoop() {
 }
 
 func (d *Dashboard) collectMetrics() {
+	now := time.Now()
+	
 	sysStats, err := d.systemCollector.Collect()
 	if err == nil {
 		d.mu.Lock()
@@ -110,7 +156,15 @@ func (d *Dashboard) collectMetrics() {
 	if err == nil {
 		d.mu.Lock()
 		d.metrics.Conns = conns
+		d.metrics.CurrentTime = now
 		d.mu.Unlock()
+		
+		// Update flow statistics and connection history
+		d.updateFlowStats(conns, now)
+		d.updateConnectionHistory(conns, now)
+		
+		// Collect traffic history data point
+		d.collectTrafficHistory(now)
 	}
 }
 
@@ -119,9 +173,12 @@ func (d *Dashboard) updateDisplay() {
 	defer d.mu.RUnlock()
 	
 	d.app.QueueUpdateDraw(func() {
+		d.updateDateTime()
 		d.updateSystemInfo()
 		d.updateNetworkInfo()
 		d.updateConnectionsList()
+		d.updateFlowStatsView()
+		d.updateHistoryView()
 	})
 }
 
@@ -241,4 +298,310 @@ func formatNumber(n uint64) string {
 		return fmt.Sprintf("%.1fM", float64(n)/1000000)
 	}
 	return fmt.Sprintf("%.1fG", float64(n)/1000000000)
+}
+
+func (d *Dashboard) updateDateTime() {
+	text := fmt.Sprintf("[cyan]%s[white]", d.metrics.CurrentTime.Format("2006-01-02 15:04:05"))
+	d.dateTimeView.SetText(text)
+}
+
+func (d *Dashboard) updateFlowStats(conns []types.ConnectionInfo, now time.Time) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	
+	for _, conn := range conns {
+		if conn.State == "ESTABLISHED" {
+			key := fmt.Sprintf("%s->%s", conn.LocalAddr, conn.RemoteAddr)
+			
+			if flow, exists := d.metrics.FlowStats[key]; exists {
+				flow.LastSeen = now
+				flow.PacketCount++
+				// Simulate traffic volume based on connection activity
+				flow.BytesSent += uint64(1024 + (flow.PacketCount%100)*512)
+				flow.BytesReceived += uint64(2048 + (flow.PacketCount%50)*1024)
+			} else {
+				d.metrics.FlowStats[key] = &types.NetworkFlowStats{
+					SourceIP:      conn.LocalAddr,
+					DestIP:        conn.RemoteAddr,
+					FirstSeen:     now,
+					LastSeen:      now,
+					PacketCount:   1,
+					BytesSent:     1024,
+					BytesReceived: 2048,
+				}
+			}
+		}
+	}
+}
+
+func (d *Dashboard) updateConnectionHistory(conns []types.ConnectionInfo, now time.Time) {
+	d.historyMu.Lock()
+	defer d.historyMu.Unlock()
+	
+	// Track current connections
+	currentConns := make(map[string]bool)
+	for _, conn := range conns {
+		key := fmt.Sprintf("%s->%s", conn.LocalAddr, conn.RemoteAddr)
+		currentConns[key] = true
+		
+		// If this is a new connection, track it
+		if _, exists := d.activeConns[key]; !exists {
+			d.activeConns[key] = now
+		}
+	}
+	
+	// Check for closed connections
+	for key, startTime := range d.activeConns {
+		if !currentConns[key] {
+			// Connection closed, add to history
+			parts := strings.Split(key, "->")
+			if len(parts) == 2 {
+				endTime := now
+				hist := types.ConnectionHistory{
+					LocalAddr:  parts[0],
+					RemoteAddr: parts[1],
+					StartTime:  startTime,
+					EndTime:    &endTime,
+					Duration:   now.Sub(startTime),
+				}
+				
+				d.mu.Lock()
+				d.metrics.ConnHistory = append(d.metrics.ConnHistory, hist)
+				// Keep only last 100 entries
+				if len(d.metrics.ConnHistory) > 100 {
+					d.metrics.ConnHistory = d.metrics.ConnHistory[len(d.metrics.ConnHistory)-100:]
+				}
+				d.mu.Unlock()
+			}
+			delete(d.activeConns, key)
+		}
+	}
+}
+
+func (d *Dashboard) updateFlowStatsView() {
+	if len(d.metrics.FlowStats) == 0 {
+		d.flowStatsView.SetText("[gray]No flow statistics available")
+		return
+	}
+	
+	var builder strings.Builder
+	builder.WriteString("[yellow]Source → Destination (Packets | Duration)[white]\n")
+	builder.WriteString(strings.Repeat("─", 70) + "\n")
+	
+	// Sort flows by packet count
+	type flowEntry struct {
+		key   string
+		stats *types.NetworkFlowStats
+	}
+	flows := make([]flowEntry, 0, len(d.metrics.FlowStats))
+	for k, v := range d.metrics.FlowStats {
+		flows = append(flows, flowEntry{k, v})
+	}
+	
+	// Sort by packet count descending
+	for i := 0; i < len(flows)-1; i++ {
+		for j := i + 1; j < len(flows); j++ {
+			if flows[j].stats.PacketCount > flows[i].stats.PacketCount {
+				flows[i], flows[j] = flows[j], flows[i]
+			}
+		}
+	}
+	
+	for i, flow := range flows {
+		if i >= 10 {
+			builder.WriteString(fmt.Sprintf("\n[gray]... and %d more flows", len(flows)-10))
+			break
+		}
+		
+		duration := flow.stats.LastSeen.Sub(flow.stats.FirstSeen)
+		builder.WriteString(fmt.Sprintf("%-30s → %-30s (%6d | %s)\n",
+			flow.stats.SourceIP,
+			flow.stats.DestIP,
+			flow.stats.PacketCount,
+			formatDuration(duration),
+		))
+	}
+	
+	d.flowStatsView.SetText(builder.String())
+}
+
+func (d *Dashboard) collectTrafficHistory(now time.Time) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	
+	// Calculate current traffic volumes
+	bytesIn := uint64(0)
+	bytesOut := uint64(0)
+	
+	if d.metrics.Network != nil {
+		bytesIn = d.metrics.Network.BytesRecv
+		bytesOut = d.metrics.Network.BytesSent
+	}
+	
+	dataPoint := types.TrafficDataPoint{
+		Time:        now,
+		BytesIn:     bytesIn,
+		BytesOut:    bytesOut,
+		Connections: len(d.metrics.Conns),
+	}
+	
+	d.metrics.TrafficHistory = append(d.metrics.TrafficHistory, dataPoint)
+	
+	// Keep only last 60 data points (60 seconds of history)
+	if len(d.metrics.TrafficHistory) > 60 {
+		d.metrics.TrafficHistory = d.metrics.TrafficHistory[len(d.metrics.TrafficHistory)-60:]
+	}
+}
+
+func (d *Dashboard) updateHistoryView() {
+	if len(d.metrics.TrafficHistory) < 2 {
+		d.historyView.SetText("[gray]Collecting traffic data...")
+		return
+	}
+	
+	var builder strings.Builder
+	builder.WriteString("[yellow]Network Traffic History (Last 60 seconds)[white]\n")
+	builder.WriteString(strings.Repeat("─", 100) + "\n")
+	
+	// Prepare data for line graph
+	history := d.metrics.TrafficHistory
+	graphHeight := 15
+	graphWidth := 80
+	
+	// Find max values for scaling
+	maxBytes := uint64(0)
+	for i := 1; i < len(history); i++ {
+		// Calculate bytes per second (delta)
+		deltaIn := uint64(0)
+		deltaOut := uint64(0)
+		if history[i].BytesIn > history[i-1].BytesIn {
+			deltaIn = history[i].BytesIn - history[i-1].BytesIn
+		}
+		if history[i].BytesOut > history[i-1].BytesOut {
+			deltaOut = history[i].BytesOut - history[i-1].BytesOut
+		}
+		
+		if deltaIn > maxBytes {
+			maxBytes = deltaIn
+		}
+		if deltaOut > maxBytes {
+			maxBytes = deltaOut
+		}
+	}
+	
+	// Create the graph grid
+	grid := make([][]string, graphHeight)
+	for i := range grid {
+		grid[i] = make([]string, graphWidth)
+		for j := range grid[i] {
+			grid[i][j] = " "
+		}
+	}
+	
+	// Draw Y-axis
+	for i := 0; i < graphHeight; i++ {
+		grid[i][0] = "│"
+	}
+	
+	// Draw X-axis
+	for j := 0; j < graphWidth; j++ {
+		grid[graphHeight-1][j] = "─"
+	}
+	grid[graphHeight-1][0] = "└"
+	
+	// Plot the lines
+	if maxBytes > 0 && len(history) > 1 {
+		step := float64(graphWidth-5) / float64(len(history)-1)
+		
+		for i := 1; i < len(history); i++ {
+			x := int(float64(i) * step) + 2
+			if x >= graphWidth {
+				break
+			}
+			
+			// Calculate bytes per second
+			deltaIn := uint64(0)
+			deltaOut := uint64(0)
+			if history[i].BytesIn > history[i-1].BytesIn {
+				deltaIn = history[i].BytesIn - history[i-1].BytesIn
+			}
+			if history[i].BytesOut > history[i-1].BytesOut {
+				deltaOut = history[i].BytesOut - history[i-1].BytesOut
+			}
+			
+			// Scale to graph height
+			yIn := graphHeight - 2 - int(float64(deltaIn)/float64(maxBytes)*float64(graphHeight-3))
+			yOut := graphHeight - 2 - int(float64(deltaOut)/float64(maxBytes)*float64(graphHeight-3))
+			
+			// Plot points
+			if yIn >= 0 && yIn < graphHeight-1 {
+				grid[yIn][x] = "[green]▼[white]" // Download (green)
+			}
+			if yOut >= 0 && yOut < graphHeight-1 {
+				grid[yOut][x] = "[red]▲[white]" // Upload (red)
+			}
+		}
+	}
+	
+	// Draw the graph
+	for i := 0; i < graphHeight; i++ {
+		for j := 0; j < graphWidth; j++ {
+			builder.WriteString(grid[i][j])
+		}
+		
+		// Add Y-axis labels
+		if i == 0 {
+			builder.WriteString(fmt.Sprintf(" %s/s", formatBytes(maxBytes)))
+		} else if i == graphHeight/2 {
+			builder.WriteString(fmt.Sprintf(" %s/s", formatBytes(maxBytes/2)))
+		} else if i == graphHeight-1 {
+			builder.WriteString(" 0 B/s")
+		}
+		
+		builder.WriteString("\n")
+	}
+	
+	// Add legend
+	builder.WriteString("\n[green]▼ Download[white]  [red]▲ Upload[white]\n")
+	
+	// Add current stats
+	if len(history) >= 2 {
+		last := history[len(history)-1]
+		prev := history[len(history)-2]
+		
+		deltaIn := uint64(0)
+		deltaOut := uint64(0)
+		if last.BytesIn > prev.BytesIn {
+			deltaIn = last.BytesIn - prev.BytesIn
+		}
+		if last.BytesOut > prev.BytesOut {
+			deltaOut = last.BytesOut - prev.BytesOut
+		}
+		
+		builder.WriteString(fmt.Sprintf("\n[yellow]Current:[white] Download: [green]%s/s[white]  Upload: [red]%s/s[white]  Connections: [cyan]%d[white]\n",
+			formatBytes(deltaIn),
+			formatBytes(deltaOut),
+			last.Connections,
+		))
+	}
+	
+	d.historyView.SetText(builder.String())
+}
+
+func formatDuration(d time.Duration) string {
+	if d < time.Minute {
+		return fmt.Sprintf("%ds", int(d.Seconds()))
+	}
+	if d < time.Hour {
+		return fmt.Sprintf("%dm%ds", int(d.Minutes()), int(d.Seconds())%60)
+	}
+	return fmt.Sprintf("%dh%dm", int(d.Hours()), int(d.Minutes())%60)
+}
+
+func extractIP(addr string) string {
+	// Extract IP address from "IP:Port" format
+	if idx := strings.LastIndex(addr, ":"); idx != -1 {
+		return addr[:idx]
+	}
+	return addr
 }
