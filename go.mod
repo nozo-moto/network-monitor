@@ -6,6 +6,7 @@ require (
 	github.com/gdamore/tcell/v2 v2.7.0
 	github.com/rivo/tview v0.0.0-20240101144852-b3bd1aa5e9f2
 	github.com/shirou/gopsutil/v3 v3.24.1
+	golang.org/x/net v0.6.0
 )
 
 require (

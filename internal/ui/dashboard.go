@@ -13,9 +13,11 @@ import (
 )
 
 type Dashboard struct {
-	app             *tview.Application
+	app              *tview.Application
 	networkCollector *collector.NetworkCollector
 	systemCollector  *collector.SystemCollector
+	processCollector *collector.ProcessCollector
+	latencyCollector *collector.LatencyCollector
 	
 	dateTimeView    *tview.TextView
 	systemInfo      *tview.TextView
@@ -23,6 +25,8 @@ type Dashboard struct {
 	connectionsList *tview.TextView
 	flowStatsView   *tview.TextView
 	historyView     *tview.TextView
+	processView     *tview.TextView
+	latencyView     *tview.TextView
 	
 	metrics         *types.Metrics
 	mu              sync.RWMutex
@@ -35,13 +39,17 @@ type Dashboard struct {
 
 func NewDashboard() *Dashboard {
 	return &Dashboard{
-		app:             tview.NewApplication(),
+		app:              tview.NewApplication(),
 		networkCollector: collector.NewNetworkCollector(),
 		systemCollector:  collector.NewSystemCollector(),
+		processCollector: collector.NewProcessCollector(),
+		latencyCollector: collector.NewLatencyCollector(),
 		metrics:         &types.Metrics{
 			FlowStats:      make(map[string]*types.NetworkFlowStats),
 			ConnHistory:    make([]types.ConnectionHistory, 0),
 			TrafficHistory: make([]types.TrafficDataPoint, 0),
+			ProcessStats:   make([]types.ProcessNetworkStats, 0),
+			LatencyStats:   make([]types.LatencyStats, 0),
 		},
 		updateInterval:  time.Second,
 		activeConns:     make(map[string]time.Time),
@@ -84,27 +92,44 @@ func (d *Dashboard) setupUI() {
 	d.flowStatsView.SetBorder(true).
 		SetTitle(" Network Flow Statistics ")
 	
+	d.processView = tview.NewTextView().
+		SetDynamicColors(true)
+	d.processView.SetBorder(true).
+		SetTitle(" Process Network Usage ")
+	
+	d.latencyView = tview.NewTextView().
+		SetDynamicColors(true)
+	d.latencyView.SetBorder(true).
+		SetTitle(" Network Latency ")
+	
 	d.historyView = tview.NewTextView().
 		SetDynamicColors(true)
 	d.historyView.SetBorder(true).
 		SetTitle(" Traffic Volume Graph ")
 	
-	// Left panel with system and network info
-	leftPanel := tview.NewFlex().
+	// Left column
+	leftColumn := tview.NewFlex().
 		SetDirection(tview.FlexRow).
 		AddItem(d.systemInfo, 8, 1, false).
-		AddItem(d.networkInfo, 0, 1, false)
+		AddItem(d.networkInfo, 10, 1, false).
+		AddItem(d.latencyView, 0, 1, false)
 	
-	// Right panel with connections and flow stats
-	rightPanel := tview.NewFlex().
+	// Middle column
+	middleColumn := tview.NewFlex().
 		SetDirection(tview.FlexRow).
 		AddItem(d.connectionsList, 0, 1, false).
 		AddItem(d.flowStatsView, 0, 1, false)
 	
-	// Top section with left and right panels
+	// Right column
+	rightColumn := tview.NewFlex().
+		SetDirection(tview.FlexRow).
+		AddItem(d.processView, 0, 1, false)
+	
+	// Top section with three columns
 	topSection := tview.NewFlex().
-		AddItem(leftPanel, 40, 1, false).
-		AddItem(rightPanel, 0, 1, false)
+		AddItem(leftColumn, 35, 1, false).
+		AddItem(middleColumn, 45, 1, false).
+		AddItem(rightColumn, 0, 1, false)
 	
 	// Main layout with date/time at top, panels in middle, history at bottom
 	mainFlex := tview.NewFlex().
@@ -166,6 +191,24 @@ func (d *Dashboard) collectMetrics() {
 		// Collect traffic history data point
 		d.collectTrafficHistory(now)
 	}
+	
+	// Collect process network stats
+	processStats, err := d.processCollector.Collect()
+	if err == nil {
+		d.mu.Lock()
+		d.metrics.ProcessStats = processStats
+		d.mu.Unlock()
+	}
+	
+	// Collect latency stats (less frequently to avoid overload)
+	if now.Second()%5 == 0 { // Every 5 seconds
+		latencyStats, err := d.latencyCollector.Collect()
+		if err == nil {
+			d.mu.Lock()
+			d.metrics.LatencyStats = latencyStats
+			d.mu.Unlock()
+		}
+	}
 }
 
 func (d *Dashboard) updateDisplay() {
@@ -178,6 +221,8 @@ func (d *Dashboard) updateDisplay() {
 		d.updateNetworkInfo()
 		d.updateConnectionsList()
 		d.updateFlowStatsView()
+		d.updateProcessView()
+		d.updateLatencyView()
 		d.updateHistoryView()
 	})
 }
@@ -621,4 +666,194 @@ func extractIP(addr string) string {
 		return addr[:idx]
 	}
 	return addr
+}
+
+func (d *Dashboard) updateProcessView() {
+	if len(d.metrics.ProcessStats) == 0 {
+		d.processView.SetText("[gray]No process data available")
+		return
+	}
+	
+	var builder strings.Builder
+	builder.WriteString("[yellow]Process              Download    Upload     Conns[white]\n")
+	builder.WriteString(strings.Repeat("─", 55) + "\n")
+	
+	// Show top 15 processes by total traffic
+	count := 0
+	for _, proc := range d.metrics.ProcessStats {
+		if count >= 15 {
+			break
+		}
+		
+		// Format process name (truncate if too long)
+		name := proc.Name
+		if len(name) > 20 {
+			name = name[:17] + "..."
+		}
+		
+		// Create traffic bar visualization
+		totalTraffic := proc.BytesSent + proc.BytesRecv
+		maxBarLength := 20
+		
+		// Calculate bar lengths (proportional to traffic)
+		downBar := ""
+		upBar := ""
+		if totalTraffic > 0 {
+			downRatio := float64(proc.BytesRecv) / float64(totalTraffic)
+			upRatio := float64(proc.BytesSent) / float64(totalTraffic)
+			
+			downLength := int(downRatio * float64(maxBarLength))
+			upLength := int(upRatio * float64(maxBarLength))
+			
+			if downLength > 0 {
+				downBar = "[green]" + strings.Repeat("▼", downLength) + "[white]"
+			}
+			if upLength > 0 {
+				upBar = "[red]" + strings.Repeat("▲", upLength) + "[white]"
+			}
+		}
+		
+		builder.WriteString(fmt.Sprintf("%-20s %8s/s  %8s/s   %3d\n",
+			name,
+			formatBytes(proc.BytesRecv),
+			formatBytes(proc.BytesSent),
+			proc.Connections,
+		))
+		
+		// Add visual bar if there's traffic
+		if downBar != "" || upBar != "" {
+			builder.WriteString(fmt.Sprintf("                     %s%s\n", downBar, upBar))
+		}
+		
+		count++
+	}
+	
+	d.processView.SetText(builder.String())
+}
+
+func (d *Dashboard) updateLatencyView() {
+	if len(d.metrics.LatencyStats) == 0 {
+		d.latencyView.SetText("[gray]Measuring latency...")
+		return
+	}
+	
+	var builder strings.Builder
+	builder.WriteString("[yellow]Host                 Latency          Loss[white]\n")
+	builder.WriteString(strings.Repeat("─", 50) + "\n")
+	
+	for _, stat := range d.metrics.LatencyStats {
+		// Format host name
+		host := stat.Host
+		if len(host) > 20 {
+			host = host[:17] + "..."
+		}
+		
+		// Create latency visualization
+		latencyBar := ""
+		barLength := 0
+		color := "[green]"
+		
+		avgMs := stat.AvgRTT.Milliseconds()
+		if avgMs < 50 {
+			color = "[green]"
+			barLength = 8
+		} else if avgMs < 100 {
+			color = "[yellow]"
+			barLength = 6
+		} else if avgMs < 200 {
+			color = "[orange]"
+			barLength = 4
+		} else {
+			color = "[red]"
+			barLength = 2
+		}
+		
+		if stat.PacketLoss == 100 {
+			color = "[red]"
+			barLength = 0
+		}
+		
+		if barLength > 0 {
+			latencyBar = color + strings.Repeat("█", barLength) + "[white]"
+		}
+		
+		// Format output
+		latencyText := "Timeout"
+		if stat.PacketLoss < 100 {
+			latencyText = fmt.Sprintf("%3dms", avgMs)
+		}
+		
+		lossText := fmt.Sprintf("%.1f%%", stat.PacketLoss)
+		if stat.PacketLoss == 0 {
+			lossText = "0%"
+		}
+		
+		// Determine status symbol
+		statusSymbol := "✓"
+		statusColor := "[green]"
+		if stat.PacketLoss == 100 {
+			statusSymbol = "✗"
+			statusColor = "[red]"
+		} else if stat.PacketLoss > 0 || avgMs > 100 {
+			statusSymbol = "⚠"
+			statusColor = "[yellow]"
+		}
+		
+		builder.WriteString(fmt.Sprintf("%-20s %s %-10s %5s %s%s[white]\n",
+			host,
+			latencyBar,
+			latencyText,
+			lossText,
+			statusColor,
+			statusSymbol,
+		))
+	}
+	
+	// Add bandwidth utilization if available
+	if d.metrics.Network != nil {
+		builder.WriteString("\n[yellow]Bandwidth Utilization[white]\n")
+		builder.WriteString(strings.Repeat("─", 50) + "\n")
+		
+		// Simulate bandwidth capacity (1 Gbps for example)
+		// In real implementation, this would be detected from interface
+		bandwidthCapacity := uint64(1000 * 1000 * 1000 / 8) // 1 Gbps in bytes
+		
+		if len(d.metrics.TrafficHistory) >= 2 {
+			last := d.metrics.TrafficHistory[len(d.metrics.TrafficHistory)-1]
+			prev := d.metrics.TrafficHistory[len(d.metrics.TrafficHistory)-2]
+			
+			deltaIn := uint64(0)
+			deltaOut := uint64(0)
+			if last.BytesIn > prev.BytesIn {
+				deltaIn = last.BytesIn - prev.BytesIn
+			}
+			if last.BytesOut > prev.BytesOut {
+				deltaOut = last.BytesOut - prev.BytesOut
+			}
+			
+			// Calculate utilization percentage
+			inPercent := float64(deltaIn) / float64(bandwidthCapacity) * 100
+			outPercent := float64(deltaOut) / float64(bandwidthCapacity) * 100
+			
+			// Create utilization bars
+			maxBarLen := 20
+			inBarLen := int(inPercent / 100 * float64(maxBarLen))
+			outBarLen := int(outPercent / 100 * float64(maxBarLen))
+			
+			if inBarLen > maxBarLen {
+				inBarLen = maxBarLen
+			}
+			if outBarLen > maxBarLen {
+				outBarLen = maxBarLen
+			}
+			
+			inBar := "[green]" + strings.Repeat("█", inBarLen) + "[gray]" + strings.Repeat("░", maxBarLen-inBarLen) + "[white]"
+			outBar := "[red]" + strings.Repeat("█", outBarLen) + "[gray]" + strings.Repeat("░", maxBarLen-outBarLen) + "[white]"
+			
+			builder.WriteString(fmt.Sprintf("Download: %s %5.1f%% (%s)\n", inBar, inPercent, formatBytes(deltaIn)+"/s"))
+			builder.WriteString(fmt.Sprintf("Upload:   %s %5.1f%% (%s)\n", outBar, outPercent, formatBytes(deltaOut)+"/s"))
+		}
+	}
+	
+	d.latencyView.SetText(builder.String())
 }

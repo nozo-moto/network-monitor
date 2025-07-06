@@ -60,12 +60,32 @@ type TrafficDataPoint struct {
 	Connections int
 }
 
+type ProcessNetworkStats struct {
+	PID         int32
+	Name        string
+	BytesSent   uint64
+	BytesRecv   uint64
+	Connections int
+}
+
+type LatencyStats struct {
+	Host        string
+	IP          string
+	MinRTT      time.Duration
+	AvgRTT      time.Duration
+	MaxRTT      time.Duration
+	PacketLoss  float64
+	LastChecked time.Time
+}
+
 type Metrics struct {
-	Network      *NetworkStats
-	System       *SystemStats
-	Conns        []ConnectionInfo
-	FlowStats    map[string]*NetworkFlowStats // key: src->dst
-	ConnHistory  []ConnectionHistory
-	CurrentTime  time.Time
+	Network        *NetworkStats
+	System         *SystemStats
+	Conns          []ConnectionInfo
+	FlowStats      map[string]*NetworkFlowStats // key: src->dst
+	ConnHistory    []ConnectionHistory
+	CurrentTime    time.Time
 	TrafficHistory []TrafficDataPoint // Time series data for line graph
+	ProcessStats   []ProcessNetworkStats
+	LatencyStats   []LatencyStats
 }
