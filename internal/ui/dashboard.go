@@ -461,12 +461,12 @@ func (d *Dashboard) updateHistoryView() {
 	
 	var builder strings.Builder
 	builder.WriteString("[yellow]Network Traffic History (Last 60 seconds)[white]\n")
-	builder.WriteString(strings.Repeat("─", 100) + "\n")
+	builder.WriteString(strings.Repeat("─", 120) + "\n\n")
 	
 	// Prepare data for line graph
 	history := d.metrics.TrafficHistory
-	graphHeight := 15
-	graphWidth := 80
+	graphHeight := 25  // Increased height
+	graphWidth := 100  // Increased width
 	
 	// Find max values for scaling
 	maxBytes := uint64(0)
@@ -489,10 +489,13 @@ func (d *Dashboard) updateHistoryView() {
 		}
 	}
 	
-	// Create the graph grid
-	grid := make([][]string, graphHeight)
+	// Create the graph grid with space for labels
+	leftMargin := 10  // Space for Y-axis labels
+	bottomMargin := 2 // Space for X-axis labels
+	
+	grid := make([][]string, graphHeight+bottomMargin)
 	for i := range grid {
-		grid[i] = make([]string, graphWidth)
+		grid[i] = make([]string, graphWidth+leftMargin)
 		for j := range grid[i] {
 			grid[i][j] = " "
 		}
@@ -500,22 +503,34 @@ func (d *Dashboard) updateHistoryView() {
 	
 	// Draw Y-axis
 	for i := 0; i < graphHeight; i++ {
-		grid[i][0] = "│"
+		grid[i][leftMargin] = "│"
 	}
 	
 	// Draw X-axis
-	for j := 0; j < graphWidth; j++ {
+	for j := leftMargin; j < graphWidth+leftMargin; j++ {
 		grid[graphHeight-1][j] = "─"
 	}
-	grid[graphHeight-1][0] = "└"
+	grid[graphHeight-1][leftMargin] = "└"
+	
+	// Add Y-axis labels
+	for i := 0; i <= 4; i++ {
+		row := i * (graphHeight-1) / 4
+		value := maxBytes * uint64(4-i) / 4
+		label := fmt.Sprintf("%7s/s", formatBytes(value))
+		for j, ch := range label {
+			if j < leftMargin {
+				grid[row][j] = string(ch)
+			}
+		}
+	}
 	
 	// Plot the lines
 	if maxBytes > 0 && len(history) > 1 {
 		step := float64(graphWidth-5) / float64(len(history)-1)
 		
 		for i := 1; i < len(history); i++ {
-			x := int(float64(i) * step) + 2
-			if x >= graphWidth {
+			x := int(float64(i) * step) + leftMargin + 2
+			if x >= graphWidth + leftMargin {
 				break
 			}
 			
@@ -543,21 +558,23 @@ func (d *Dashboard) updateHistoryView() {
 		}
 	}
 	
+	// Add X-axis time labels
+	timeLabels := []string{"-60s", "-45s", "-30s", "-15s", "0s"}
+	labelPositions := []int{0, 25, 50, 75, 95}
+	for i, label := range timeLabels {
+		pos := leftMargin + labelPositions[i]
+		if pos < len(grid[graphHeight]) - len(label) {
+			for j, ch := range label {
+				grid[graphHeight][pos+j] = string(ch)
+			}
+		}
+	}
+	
 	// Draw the graph
-	for i := 0; i < graphHeight; i++ {
-		for j := 0; j < graphWidth; j++ {
+	for i := 0; i < graphHeight+bottomMargin; i++ {
+		for j := 0; j < graphWidth+leftMargin; j++ {
 			builder.WriteString(grid[i][j])
 		}
-		
-		// Add Y-axis labels
-		if i == 0 {
-			builder.WriteString(fmt.Sprintf(" %s/s", formatBytes(maxBytes)))
-		} else if i == graphHeight/2 {
-			builder.WriteString(fmt.Sprintf(" %s/s", formatBytes(maxBytes/2)))
-		} else if i == graphHeight-1 {
-			builder.WriteString(" 0 B/s")
-		}
-		
 		builder.WriteString("\n")
 	}
 	
