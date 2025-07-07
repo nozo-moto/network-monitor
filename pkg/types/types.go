@@ -28,8 +28,11 @@ type SystemStats struct {
 type ConnectionInfo struct {
 	LocalAddr  string
 	RemoteAddr string
+	LocalPort  uint32
+	RemotePort uint32
 	State      string
 	Type       string
+	PID        uint32
 }
 
 type NetworkFlowStats struct {
@@ -61,11 +64,12 @@ type TrafficDataPoint struct {
 }
 
 type ProcessNetworkStats struct {
-	PID         int32
-	Name        string
-	BytesSent   uint64
-	BytesRecv   uint64
-	Connections int
+	PID             int32
+	Name            string
+	BytesSent       uint64
+	BytesRecv       uint64
+	Connections     int
+	ConnectionCount int
 }
 
 type LatencyStats struct {

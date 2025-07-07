@@ -18,7 +18,9 @@ type Dashboard struct {
 	systemCollector  *collector.SystemCollector
 	processCollector *collector.ProcessCollector
 	latencyCollector *collector.LatencyCollector
+	ebpfCollector    *collector.EBPFCollector
 	
+	pages           *tview.Pages
 	dateTimeView    *tview.TextView
 	systemInfo      *tview.TextView
 	networkInfo     *tview.TextView
@@ -27,6 +29,8 @@ type Dashboard struct {
 	historyView     *tview.TextView
 	processView     *tview.TextView
 	latencyView     *tview.TextView
+	
+	processDetailView *ProcessView
 	
 	metrics         *types.Metrics
 	mu              sync.RWMutex
@@ -38,8 +42,10 @@ type Dashboard struct {
 }
 
 func NewDashboard() *Dashboard {
-	return &Dashboard{
-		app:              tview.NewApplication(),
+	app := tview.NewApplication()
+	d := &Dashboard{
+		app:              app,
+		pages:            tview.NewPages(),
 		networkCollector: collector.NewNetworkCollector(),
 		systemCollector:  collector.NewSystemCollector(),
 		processCollector: collector.NewProcessCollector(),
@@ -54,6 +60,10 @@ func NewDashboard() *Dashboard {
 		updateInterval:  time.Second,
 		activeConns:     make(map[string]time.Time),
 	}
+	
+	d.processDetailView = NewProcessView(app)
+	
+	return d
 }
 
 func (d *Dashboard) Run() error {
@@ -62,6 +72,10 @@ func (d *Dashboard) Run() error {
 	go d.updateLoop()
 	
 	return d.app.Run()
+}
+
+func (d *Dashboard) SetEBPFCollector(collector *collector.EBPFCollector) {
+	d.ebpfCollector = collector
 }
 
 func (d *Dashboard) setupUI() {
@@ -128,7 +142,7 @@ func (d *Dashboard) setupUI() {
 	// Top section with three columns
 	topSection := tview.NewFlex().
 		AddItem(leftColumn, 35, 1, false).
-		AddItem(middleColumn, 45, 1, false).
+		AddItem(middleColumn, 0, 2, false).
 		AddItem(rightColumn, 0, 1, false)
 	
 	// Main layout with date/time at top, panels in middle, history at bottom
@@ -138,10 +152,35 @@ func (d *Dashboard) setupUI() {
 		AddItem(topSection, 0, 1, false).
 		AddItem(d.historyView, 0, 1, false)
 	
-	d.app.SetRoot(mainFlex, true).
+	// Add main dashboard to pages
+	d.pages.AddPage("main", mainFlex, true, true)
+	d.pages.AddPage("process", d.processDetailView.GetPages(), true, false)
+	
+	d.app.SetRoot(d.pages, true).
 		SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
-			if event.Key() == tcell.KeyEsc || event.Rune() == 'q' {
+			currentPage, _ := d.pages.GetFrontPage()
+			
+			switch event.Key() {
+			case tcell.KeyEsc:
+				if currentPage == "process" {
+					d.pages.SwitchToPage("main")
+					return nil
+				}
 				d.app.Stop()
+			case tcell.KeyRune:
+				switch event.Rune() {
+				case 'q':
+					if currentPage == "process" {
+						d.pages.SwitchToPage("main")
+						return nil
+					}
+					d.app.Stop()
+				case 'p':
+					if currentPage == "main" {
+						d.pages.SwitchToPage("process")
+						return nil
+					}
+				}
 			}
 			return event
 		})
@@ -195,6 +234,32 @@ func (d *Dashboard) collectMetrics() {
 	// Collect process network stats
 	processStats, err := d.processCollector.Collect()
 	if err == nil {
+		// Merge with eBPF data if available
+		if d.ebpfCollector != nil && d.ebpfCollector.IsEnabled() {
+			ebpfMetrics := d.ebpfCollector.GetProcessMetrics()
+			for pid, ebpfData := range ebpfMetrics {
+				found := false
+				for i, ps := range processStats {
+					if ps.PID == int32(pid) {
+						// Update with eBPF data (more accurate)
+						processStats[i].BytesSent = ebpfData.BytesSent
+						processStats[i].BytesRecv = ebpfData.BytesRecv
+						found = true
+						break
+					}
+				}
+				if !found {
+					// Add new process from eBPF
+					processStats = append(processStats, types.ProcessNetworkStats{
+						PID:       int32(pid),
+						Name:      ebpfData.Name,
+						BytesSent: ebpfData.BytesSent,
+						BytesRecv: ebpfData.BytesRecv,
+					})
+				}
+			}
+		}
+		
 		d.mu.Lock()
 		d.metrics.ProcessStats = processStats
 		d.mu.Unlock()
@@ -213,7 +278,8 @@ func (d *Dashboard) collectMetrics() {
 
 func (d *Dashboard) updateDisplay() {
 	d.mu.RLock()
-	defer d.mu.RUnlock()
+	metrics := *d.metrics
+	d.mu.RUnlock()
 	
 	d.app.QueueUpdateDraw(func() {
 		d.updateDateTime()
@@ -224,6 +290,25 @@ func (d *Dashboard) updateDisplay() {
 		d.updateProcessView()
 		d.updateLatencyView()
 		d.updateHistoryView()
+		
+		// Update process detail view with network metrics
+		networkMetrics := types.NetworkMetrics{
+			Connections:     metrics.Conns,
+			ProcessNetworks: make([]types.ProcessNetwork, 0),
+		}
+		
+		// Convert ProcessStats to ProcessNetwork
+		for _, ps := range metrics.ProcessStats {
+			networkMetrics.ProcessNetworks = append(networkMetrics.ProcessNetworks, types.ProcessNetwork{
+				PID:             int(ps.PID),
+				Name:            ps.Name,
+				BytesSent:       ps.BytesSent,
+				BytesRecv:       ps.BytesRecv,
+				ConnectionCount: ps.ConnectionCount,
+			})
+		}
+		
+		d.processDetailView.Update(networkMetrics)
 	})
 }
 
@@ -430,7 +515,7 @@ func (d *Dashboard) updateFlowStatsView() {
 	}
 	
 	var builder strings.Builder
-	builder.WriteString("[yellow]Source → Destination (Packets | Duration)[white]\n")
+	builder.WriteString("[yellow]Source → Destination                            (Packets | Duration)[white]\n")
 	builder.WriteString(strings.Repeat("─", 70) + "\n")
 	
 	// Sort flows by packet count
@@ -459,7 +544,7 @@ func (d *Dashboard) updateFlowStatsView() {
 		}
 		
 		duration := flow.stats.LastSeen.Sub(flow.stats.FirstSeen)
-		builder.WriteString(fmt.Sprintf("%-30s → %-30s (%6d | %s)\n",
+		builder.WriteString(fmt.Sprintf("%-30s → %-25s (%6d | %s)\n",
 			flow.stats.SourceIP,
 			flow.stats.DestIP,
 			flow.stats.PacketCount,
@@ -738,7 +823,8 @@ func (d *Dashboard) updateLatencyView() {
 	}
 	
 	var builder strings.Builder
-	builder.WriteString("[yellow]Host                 Latency          Loss[white]\n")
+	builder.WriteString("[yellow]Host\n")
+	builder.WriteString("Latency               Loss[white]\n")
 	builder.WriteString(strings.Repeat("─", 50) + "\n")
 	
 	for _, stat := range d.metrics.LatencyStats {
@@ -799,14 +885,16 @@ func (d *Dashboard) updateLatencyView() {
 			statusColor = "[yellow]"
 		}
 		
-		builder.WriteString(fmt.Sprintf("%-20s %s %-10s %5s %s%s[white]\n",
+		builder.WriteString(fmt.Sprintf("\n%-20s %14s %8s %s%s[white]\n",
 			host,
-			latencyBar,
 			latencyText,
 			lossText,
 			statusColor,
 			statusSymbol,
 		))
+		if barLength > 0 {
+			builder.WriteString(latencyBar + "\n")
+		}
 	}
 	
 	// Add bandwidth utilization if available
