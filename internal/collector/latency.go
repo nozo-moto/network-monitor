@@ -1,6 +1,7 @@
 package collector
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"sync"
@@ -44,11 +45,15 @@ func (lc *LatencyCollector) Collect() ([]types.LatencyStats, error) {
 	var wg sync.WaitGroup
 	resultsChan := make(chan types.LatencyStats, len(targets))
 
+	// Create context with timeout for all measurements
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
 	for _, target := range targets {
 		wg.Add(1)
 		go func(host string) {
 			defer wg.Done()
-			stats := lc.measureLatency(host)
+			stats := lc.measureLatencyWithContext(ctx, host)
 			resultsChan <- stats
 		}(target)
 	}
@@ -66,31 +71,54 @@ func (lc *LatencyCollector) Collect() ([]types.LatencyStats, error) {
 }
 
 func (lc *LatencyCollector) measureLatency(host string) types.LatencyStats {
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+	return lc.measureLatencyWithContext(ctx, host)
+}
+
+func (lc *LatencyCollector) measureLatencyWithContext(ctx context.Context, host string) types.LatencyStats {
 	stats := types.LatencyStats{
 		Host:        host,
 		LastChecked: time.Now(),
 	}
 
-	// Resolve hostname to IP
-	ips, err := net.LookupIP(host)
+	// Resolve hostname to IP with timeout
+	resolver := &net.Resolver{}
+	ips, err := resolver.LookupIPAddr(ctx, host)
 	if err != nil || len(ips) == 0 {
 		stats.PacketLoss = 100.0
 		return stats
 	}
-	stats.IP = ips[0].String()
+	stats.IP = ips[0].IP.String()
 
 	// Perform multiple pings to calculate statistics
-	const pingCount = 4
+	const pingCount = 3 // Reduced from 4 to speed up
 	var rtts []time.Duration
 	successCount := 0
 
 	for i := 0; i < pingCount; i++ {
-		rtt, err := lc.ping(ips[0].String())
+		// Check context cancellation
+		select {
+		case <-ctx.Done():
+			// Timeout reached, return what we have
+			break
+		default:
+		}
+		
+		rtt, err := lc.pingWithTimeout(ips[0].IP.String(), 2*time.Second)
 		if err == nil {
 			rtts = append(rtts, rtt)
 			successCount++
 		}
-		time.Sleep(100 * time.Millisecond)
+		
+		// Only sleep if not the last ping
+		if i < pingCount-1 {
+			select {
+			case <-ctx.Done():
+				break
+			case <-time.After(50 * time.Millisecond): // Reduced from 100ms
+			}
+		}
 	}
 
 	// Calculate statistics
@@ -121,16 +149,20 @@ func (lc *LatencyCollector) measureLatency(host string) types.LatencyStats {
 }
 
 func (lc *LatencyCollector) ping(dst string) (time.Duration, error) {
+	return lc.pingWithTimeout(dst, 5*time.Second)
+}
+
+func (lc *LatencyCollector) pingWithTimeout(dst string, timeout time.Duration) (time.Duration, error) {
 	// Note: This is a simplified ping implementation
 	// Real ICMP ping requires root privileges on most systems
 	// For production, consider using a library like github.com/go-ping/ping
 	
 	// For now, we'll use a simple TCP connection test as a fallback
 	start := time.Now()
-	conn, err := net.DialTimeout("tcp", dst+":80", 5*time.Second)
+	conn, err := net.DialTimeout("tcp", dst+":80", timeout)
 	if err != nil {
 		// Try HTTPS port if HTTP fails
-		conn, err = net.DialTimeout("tcp", dst+":443", 5*time.Second)
+		conn, err = net.DialTimeout("tcp", dst+":443", timeout)
 		if err != nil {
 			return 0, err
 		}

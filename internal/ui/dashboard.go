@@ -39,6 +39,13 @@ type Dashboard struct {
 	// For tracking connection history
 	activeConns     map[string]time.Time
 	historyMu       sync.RWMutex
+	
+	// Async collection state
+	collectingSystem  bool
+	collectingNetwork bool
+	collectingProcess bool
+	collectingLatency bool
+	lastLatencyTime   time.Time
 }
 
 func NewDashboard() *Dashboard {
@@ -69,7 +76,9 @@ func NewDashboard() *Dashboard {
 func (d *Dashboard) Run() error {
 	d.setupUI()
 	
-	go d.updateLoop()
+	// Start separate goroutines for UI updates and data collection
+	go d.updateLoop()      // UI updates every second
+	go d.collectionLoop()  // Data collection loop
 	
 	return d.app.Run()
 }
@@ -193,14 +202,58 @@ func (d *Dashboard) updateLoop() {
 	for {
 		select {
 		case <-ticker.C:
-			d.collectMetrics()
+			// Update time immediately
+			d.mu.Lock()
+			d.metrics.CurrentTime = time.Now()
+			d.mu.Unlock()
+			
+			// Update display without blocking
 			d.updateDisplay()
 		}
 	}
 }
 
-func (d *Dashboard) collectMetrics() {
-	now := time.Now()
+// Separate collection loop to prevent blocking UI updates
+func (d *Dashboard) collectionLoop() {
+	// Stagger collection to spread load
+	time.Sleep(100 * time.Millisecond)
+	
+	ticker := time.NewTicker(500 * time.Millisecond) // Collect more frequently
+	defer ticker.Stop()
+	
+	for {
+		select {
+		case <-ticker.C:
+			now := time.Now()
+			
+			// System stats - collect every tick if not already collecting
+			if !d.collectingSystem {
+				go d.collectSystemStats()
+			}
+			
+			// Network stats - collect every tick if not already collecting
+			if !d.collectingNetwork {
+				go d.collectNetworkStats()
+			}
+			
+			// Process stats - collect every 2 seconds
+			if !d.collectingProcess && now.UnixNano()%(2*1e9) < 5e8 {
+				go d.collectProcessStats()
+			}
+			
+			// Latency stats - collect every 10 seconds
+			if !d.collectingLatency && now.Sub(d.lastLatencyTime) > 10*time.Second {
+				go d.collectLatencyStats()
+				d.lastLatencyTime = now
+			}
+		}
+	}
+}
+
+// Async collection methods
+func (d *Dashboard) collectSystemStats() {
+	d.collectingSystem = true
+	defer func() { d.collectingSystem = false }()
 	
 	sysStats, err := d.systemCollector.Collect()
 	if err == nil {
@@ -208,7 +261,15 @@ func (d *Dashboard) collectMetrics() {
 		d.metrics.System = sysStats
 		d.mu.Unlock()
 	}
+}
+
+func (d *Dashboard) collectNetworkStats() {
+	d.collectingNetwork = true
+	defer func() { d.collectingNetwork = false }()
 	
+	now := time.Now()
+	
+	// Collect network interface stats
 	netStats, err := d.networkCollector.Collect()
 	if err == nil && len(netStats) > 0 {
 		d.mu.Lock()
@@ -216,22 +277,41 @@ func (d *Dashboard) collectMetrics() {
 		d.mu.Unlock()
 	}
 	
-	conns, err := d.networkCollector.GetConnections()
-	if err == nil {
-		d.mu.Lock()
-		d.metrics.Conns = conns
-		d.metrics.CurrentTime = now
-		d.mu.Unlock()
-		
-		// Update flow statistics and connection history
-		d.updateFlowStats(conns, now)
-		d.updateConnectionHistory(conns, now)
-		
-		// Collect traffic history data point
-		d.collectTrafficHistory(now)
-	}
+	// Collect connections with timeout
+	connsCh := make(chan []types.ConnectionInfo, 1)
+	go func() {
+		conns, err := d.networkCollector.GetConnections()
+		if err == nil {
+			connsCh <- conns
+		} else {
+			connsCh <- nil
+		}
+	}()
 	
-	// Collect process network stats
+	// Wait with timeout
+	select {
+	case conns := <-connsCh:
+		if conns != nil {
+			d.mu.Lock()
+			d.metrics.Conns = conns
+			d.mu.Unlock()
+			
+			// Update flow statistics and connection history
+			d.updateFlowStats(conns, now)
+			d.updateConnectionHistory(conns, now)
+			
+			// Collect traffic history data point
+			d.collectTrafficHistory(now)
+		}
+	case <-time.After(2 * time.Second):
+		// Timeout - skip this update
+	}
+}
+
+func (d *Dashboard) collectProcessStats() {
+	d.collectingProcess = true
+	defer func() { d.collectingProcess = false }()
+	
 	processStats, err := d.processCollector.Collect()
 	if err == nil {
 		// Merge with eBPF data if available
@@ -264,15 +344,33 @@ func (d *Dashboard) collectMetrics() {
 		d.metrics.ProcessStats = processStats
 		d.mu.Unlock()
 	}
+}
+
+func (d *Dashboard) collectLatencyStats() {
+	d.collectingLatency = true
+	defer func() { d.collectingLatency = false }()
 	
-	// Collect latency stats (less frequently to avoid overload)
-	if now.Second()%5 == 0 { // Every 5 seconds
+	// Run latency collection with timeout
+	latencyCh := make(chan []types.LatencyStats, 1)
+	go func() {
 		latencyStats, err := d.latencyCollector.Collect()
 		if err == nil {
+			latencyCh <- latencyStats
+		} else {
+			latencyCh <- nil
+		}
+	}()
+	
+	// Wait with timeout to prevent blocking
+	select {
+	case stats := <-latencyCh:
+		if stats != nil {
 			d.mu.Lock()
-			d.metrics.LatencyStats = latencyStats
+			d.metrics.LatencyStats = stats
 			d.mu.Unlock()
 		}
+	case <-time.After(5 * time.Second):
+		// Timeout - skip this update
 	}
 }
 
